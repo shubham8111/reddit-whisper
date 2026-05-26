@@ -1,0 +1,21 @@
+{
+  "name": "reddit-whisper",
+  "version": "1.0.0",
+  "description": "Scrapes and filters Reddit comments in real-time and speaks them aloud via text-to-speech.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "open": "^10.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Antigravity",
+  "license": "MIT"
+}
