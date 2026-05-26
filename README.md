@@ -1,5 +1,7 @@
 # 🎙️ Reddit Whisper - Live Match Thread Soundcaster
 
+![Reddit Whisper Dashboard Interface](screenshot.png)
+
 Reddit Whisper is a premium, real-time comment scraper and Text-To-Speech (TTS) audio broadcaster designed specifically for following highly active Reddit threads—such as live cricket match threads—without needing to constantly look at your screen. 
 
 The application monitors any public Reddit thread, identifies high-quality comments that cross a customizable upvote threshold ("N" upvotes), cleans them for smooth spoken delivery, and speaks them aloud using system-native voices (auto-selecting the premium Indian English **Rishi** voice when available).
