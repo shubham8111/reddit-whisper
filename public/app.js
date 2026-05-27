@@ -103,19 +103,25 @@ function loadVoices() {
     return;
   }
 
-  // Group and sort voices (English first, then others)
+  // Filter voices to keep only English (EN) and Indian (IN) voices, placing Indian voices at the top
+  const indianVoices = [];
   const englishVoices = [];
-  const otherVoices = [];
   
   state.voices.forEach(voice => {
-    if (voice.lang.startsWith('en')) {
+    const lang = voice.lang.toLowerCase();
+    const name = voice.name.toLowerCase();
+    
+    const isIndian = lang.endsWith('-in') || lang.startsWith('hi') || name.includes('india');
+    const isEnglish = lang.startsWith('en');
+    
+    if (isIndian) {
+      indianVoices.push(voice);
+    } else if (isEnglish) {
       englishVoices.push(voice);
-    } else {
-      otherVoices.push(voice);
     }
   });
 
-  const sortedVoices = [...englishVoices, ...otherVoices];
+  const sortedVoices = [...indianVoices, ...englishVoices];
   
   sortedVoices.forEach(voice => {
     const option = document.createElement('option');
