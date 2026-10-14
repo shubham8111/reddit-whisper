@@ -43,7 +43,13 @@ graph TD
 
 - **Backend**: Node.js, Express.js, CORS, ESM (`import/export`)
 - **Frontend**: Semantic HTML5, CSS Variables, Vanilla CSS layout system
-- **Audio Engine**: Native Web Speech API (`window.speechSynthesis`)
+- **Audio Engine**: Native Web Speech API (`window.speechSynthesis`), plus optional on-device neural voices via [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) ([kokoro-js](https://www.npmjs.com/package/kokoro-js)) running on the GPU through WebGPU
+
+### 🧠 Neural voices (Kokoro, on-device GPU)
+Pick any **Kokoro** voice in the voice selector to use a neural TTS model that runs entirely in your browser on the GPU (Metal on Apple Silicon via WebGPU).
+- Requires a WebGPU-capable browser (Chrome/Edge, or Safari 26+).
+- First use downloads the model once (~330 MB); afterwards it's cached and works offline. Loading the model adds roughly 1.4 GB of RAM to the browser tab.
+- Speed slider applies; pitch is not supported for neural voices. If the model fails to load, playback falls back to the system voice.
 
 ---
 
@@ -63,6 +69,16 @@ Run the local server using standard npm scripts:
 npm start
 ```
 This starts the Node backend at [http://localhost:3000](http://localhost:3000) and **automatically pops open** the web application in your default browser!
+
+### 2b. Give it Reddit access (needed now)
+Reddit blocks anonymous requests for thread data (403 / redirect to login), and public Redlib mirrors come and go. For reliable fetching, give the app your Reddit login session:
+
+1. In Chrome, open **reddit.com** (logged in) and open DevTools (`⌥⌘I`).
+2. Open the **Application** tab (if hidden: click **»** at the end of the tab bar, or press `⌘⇧P` → *Show Application*), then **Cookies → https://www.reddit.com**, and copy the **Value** of `reddit_session`.
+   *Alternative:* in the **Network** tab, reload, click the first request and copy the whole `cookie` request header. That works too.
+3. In the app, paste it under **Reddit Access** and click **Save**. It's active immediately and saved to `.env` (gitignored, owner-only). **Sign out** removes it.
+
+You can also set `REDDIT_SESSION` in `.env` yourself (see `.env.example`). The startup log shows which mode is active (`🔑 Reddit access: ...`). Without a session the app still tries anonymous access and then the mirrors (`REDLIB_MIRRORS` lets you add your own). Treat the cookie like a password.
 
 ### 3. Setup your Soundcaster
 1. **Thread Setup**: Copy the URL of any active Reddit thread (such as `/r/Cricket` match threads) and click the **Paste (📋)** icon.
@@ -92,6 +108,6 @@ reddit_whisper/
 ## 🔒 Security & Privacy
 
 This application is **100% serverless on the cloud** and operates purely on your local machine.
-- No Reddit accounts or OAuth client secrets are used.
+- Your Reddit login cookie (if you add one) is stored only in your local `.env` and sent only to reddit.com; it's never sent back to the web page.
 - Zero tracking scripts or third-party analytics are embedded.
 - No Personal Identifiable Information (PII) or developer secrets are hardcoded anywhere in the codebase.

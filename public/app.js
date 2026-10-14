@@ -28,10 +28,28 @@ const state = {
   currentUtterance: null,
   
   // Timers
-  pollingIntervalId: null,
+  pollingTimeoutId: null,
   countdownIntervalId: null,
-  countdownTimeLeft: 0
+  countdownTimeLeft: 0,
+  nextPollAt: 0,
+  isFetching: false,
+  consecutiveErrors: 0,
+  fetchSource: '',
+  
+  // Auto-tune: picks threshold/window per refresh so 1–10 comments are read.
+  // upvoteThreshold/lookupWindow stay the user's manual values; these are the effective ones.
+  autoTune: true,
+  autoThreshold: null,
+  autoLookupWindow: null
 };
+
+const AUTO_MIN_COMMENTS = 1;
+const AUTO_MAX_COMMENTS = 10;
+const LOOKUP_WINDOW_MAX = 1800; // Matches the lookup slider's max
+
+// Older cards are pruned so the DOM stays light during multi-hour match threads
+const MAX_FEED_CARDS = 150;
+const MAX_ERROR_BACKOFF_SEC = 300;
 
 // --- DOM Elements ---
 const elements = {
@@ -54,6 +72,7 @@ const elements = {
   voicePitchInput: document.getElementById('voice-pitch'),
   pitchVal: document.getElementById('pitch-val'),
   btnTestVoice: document.getElementById('btn-test-voice'),
+  ttsModelStatus: document.getElementById('tts-model-status'),
   
   btnToggleListening: document.getElementById('btn-toggle-listening'),
   btnText: document.getElementById('btn-text'),
@@ -70,30 +89,191 @@ const elements = {
   soundwave: document.getElementById('soundwave-visualizer'),
   commentsFeed: document.getElementById('comments-feed'),
   feedEmpty: document.getElementById('feed-empty'),
-  btnClearFeed: document.getElementById('btn-clear-feed')
+  btnClearFeed: document.getElementById('btn-clear-feed'),
+  autoTuneInput: document.getElementById('auto-tune'),
+  authStatus: document.getElementById('auth-status'),
+  authHint: document.getElementById('auth-hint'),
+  sessionPaste: document.getElementById('session-paste'),
+  sessionForm: document.getElementById('session-form'),
+  sessionInput: document.getElementById('session-input'),
+  btnSaveSession: document.getElementById('btn-save-session'),
+  btnClearSession: document.getElementById('btn-clear-session')
 };
 
 // --- Web Speech API (TTS) Setup ---
 const synth = window.speechSynthesis;
 
-function loadVoices() {
+// --- Kokoro Neural TTS (on-device, WebGPU / Metal) ---
+const KOKORO_PREFIX = 'kokoro:';
+const KOKORO_MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
+const KOKORO_LIB_URL = 'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm';
+const KOKORO_VOICES = [
+  { id: 'af_heart', label: 'Heart (US, female)' },
+  { id: 'af_bella', label: 'Bella (US, female)' },
+  { id: 'af_nicole', label: 'Nicole (US, female)' },
+  { id: 'am_michael', label: 'Michael (US, male)' },
+  { id: 'am_fenrir', label: 'Fenrir (US, male)' },
+  { id: 'bf_emma', label: 'Emma (UK, female)' },
+  { id: 'bm_george', label: 'George (UK, male)' }
+];
+const hasWebGPU = 'gpu' in navigator;
+
+const kokoroEngine = {
+  tts: null,
+  loading: null,
+  audioCtx: null,
+  currentSource: null,
+  playToken: 0 // Incremented on stop so in-flight generations don't start playing afterwards
+};
+
+function setModelStatus(text) {
+  if (elements.ttsModelStatus) elements.ttsModelStatus.textContent = `Neural model: ${text}`;
+}
+
+function isKokoroVoice(name = state.selectedVoiceName) {
+  return name.startsWith(KOKORO_PREFIX);
+}
+
+async function getKokoro() {
+  if (kokoroEngine.tts) return kokoroEngine.tts;
+  if (!hasWebGPU) throw new Error('WebGPU is not available in this browser');
+  
+  kokoroEngine.loading ??= (async () => {
+    setModelStatus('downloading… (~330 MB, first time only)');
+    const { KokoroTTS } = await import(KOKORO_LIB_URL);
+    const tts = await KokoroTTS.from_pretrained(KOKORO_MODEL_ID, { dtype: 'fp32', device: 'webgpu' });
+    setModelStatus('ready (WebGPU)');
+    return tts;
+  })().catch(err => {
+    kokoroEngine.loading = null;
+    setModelStatus('failed to load — using system voice');
+    throw err;
+  });
+  
+  kokoroEngine.tts = await kokoroEngine.loading;
+  return kokoroEngine.tts;
+}
+
+function getAudioContext() {
+  kokoroEngine.audioCtx ??= new AudioContext();
+  if (kokoroEngine.audioCtx.state === 'suspended') kokoroEngine.audioCtx.resume();
+  return kokoroEngine.audioCtx;
+}
+
+async function generateKokoroAudio(text, voiceName) {
+  const tts = await getKokoro();
+  return tts.generate(text, { voice: voiceName.slice(KOKORO_PREFIX.length), speed: state.speechRate });
+}
+
+function playKokoroAudio(rawAudio, { onStart, onEnd }) {
+  const ctx = getAudioContext();
+  const buffer = ctx.createBuffer(1, rawAudio.audio.length, rawAudio.sampling_rate);
+  buffer.copyToChannel(rawAudio.audio, 0);
+  
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.onended = () => {
+    if (kokoroEngine.currentSource === source) kokoroEngine.currentSource = null;
+    onEnd?.();
+  };
+  kokoroEngine.currentSource = source;
+  source.start();
+  onStart?.();
+}
+
+function speakWithSystem(text, { onStart, onEnd, voiceName = state.selectedVoiceName } = {}) {
   if (!synth) {
-    elements.voiceSelect.innerHTML = '<option value="">TTS Not Supported in browser</option>';
+    onEnd?.();
+    return;
+  }
+  const utterance = new SpeechSynthesisUtterance(text);
+  const activeVoice = state.voices.find(v => v.name === voiceName);
+  if (activeVoice) utterance.voice = activeVoice;
+  utterance.rate = state.speechRate;
+  utterance.pitch = state.speechPitch;
+  
+  utterance.onstart = () => onStart?.();
+  utterance.onend = () => onEnd?.();
+  utterance.onerror = (e) => {
+    console.error('Speech synthesis error:', e);
+    onEnd?.();
+  };
+  synth.speak(utterance);
+}
+
+// Speaks text with the selected engine. `pendingAudio` may carry a pre-generated Kokoro clip.
+async function speakText(text, { onStart, onEnd, pendingAudio } = {}) {
+  const voiceName = state.selectedVoiceName;
+  if (!isKokoroVoice(voiceName)) {
+    speakWithSystem(text, { onStart, onEnd, voiceName });
+    return;
+  }
+  
+  const token = kokoroEngine.playToken;
+  try {
+    const rawAudio = await (pendingAudio ?? generateKokoroAudio(text, voiceName));
+    // Stopped while generating: end like a cancelled utterance so queues keep moving
+    if (token !== kokoroEngine.playToken) return onEnd?.();
+    playKokoroAudio(rawAudio, { onStart, onEnd });
+  } catch (err) {
+    console.error('Kokoro TTS error, falling back to system voice:', err);
+    if (token !== kokoroEngine.playToken) return onEnd?.();
+    const fallback = state.voices.find(v => v.name.toLowerCase().includes('samantha')) || state.voices[0];
+    speakWithSystem(text, { onStart, onEnd, voiceName: fallback?.name });
+  }
+}
+
+function stopSpeech() {
+  kokoroEngine.playToken++;
+  if (synth) synth.cancel();
+  // Stopping fires the source's onended, mirroring how synth.cancel() fires onerror/onend
+  kokoroEngine.currentSource?.stop();
+}
+
+function syncPitchControl() {
+  // Kokoro has no pitch control; only speed applies
+  elements.voicePitchInput.disabled = isKokoroVoice();
+  elements.voicePitchInput.title = isKokoroVoice() ? 'Pitch is not supported by neural voices' : '';
+}
+
+function appendKokoroVoices() {
+  const group = document.createElement('optgroup');
+  group.label = hasWebGPU ? 'Neural · Kokoro (on-device GPU)' : 'Neural · Kokoro (needs WebGPU)';
+  
+  KOKORO_VOICES.forEach(({ id, label }) => {
+    const option = document.createElement('option');
+    option.value = KOKORO_PREFIX + id;
+    option.textContent = `Kokoro ${label}`;
+    option.disabled = !hasWebGPU;
+    option.selected = option.value === state.selectedVoiceName;
+    group.appendChild(option);
+  });
+  
+  elements.voiceSelect.appendChild(group);
+}
+
+function loadVoices() {
+  elements.voiceSelect.innerHTML = '';
+  appendKokoroVoices();
+  
+  if (!synth) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'System TTS not supported in browser';
+    elements.voiceSelect.appendChild(opt);
     return;
   }
   
   state.voices = synth.getVoices();
   
-  // Try to set 'Rishi' from India as the default voice if available on first load
+  // Try to set 'Samantha' from macOS as the default voice if available on first load
   if (!state.selectedVoiceName && state.voices.length > 0) {
-    const rishiVoice = state.voices.find(v => v.name.toLowerCase().includes('rishi'));
-    if (rishiVoice) {
-      state.selectedVoiceName = rishiVoice.name;
+    const samanthaVoice = state.voices.find(v => v.name.toLowerCase().includes('samantha'));
+    if (samanthaVoice) {
+      state.selectedVoiceName = samanthaVoice.name;
     }
   }
-  
-  // Render voices in select dropdown
-  elements.voiceSelect.innerHTML = '';
   
   if (state.voices.length === 0) {
     // Some browsers load voices asynchronously. Wait for voiceschanged event.
@@ -102,42 +282,81 @@ function loadVoices() {
     elements.voiceSelect.appendChild(opt);
     return;
   }
+  
+  const systemGroup = document.createElement('optgroup');
+  systemGroup.label = 'System voices';
+  elements.voiceSelect.appendChild(systemGroup);
 
-  // Filter voices to keep only English (EN) and Indian (IN) voices, placing Indian voices at the top
-  const indianVoices = [];
-  const englishVoices = [];
+  // Filter voices to keep only:
+  // 1. Local macOS voices that are "enhanced" or "premium" (or standard Samantha)
+  // 2. English (EN) or Indian (IN) voices from Google/Chrome speech engines
+  const filteredVoices = [];
   
   state.voices.forEach(voice => {
-    const lang = voice.lang.toLowerCase();
     const name = voice.name.toLowerCase();
+    const lang = voice.lang.toLowerCase();
+    const isLocal = voice.localService;
     
-    const isIndian = lang.endsWith('-in') || lang.startsWith('hi') || name.includes('india');
-    const isEnglish = lang.startsWith('en');
+    // Condition 1: High-quality local macOS voices
+    const isEnhancedOrPremiumLocal = isLocal && (
+      name.includes('enhanced') || 
+      name.includes('premium') || 
+      name.includes('samantha') ||
+      name.includes('alex') ||
+      name.includes('siri') ||
+      name.includes('rishi')
+    );
     
-    if (isIndian) {
-      indianVoices.push(voice);
-    } else if (isEnglish) {
-      englishVoices.push(voice);
+    // Condition 2: English or Indian Google/Chrome voices
+    const isEnglishOrIndian = lang.startsWith('en') || lang.endsWith('-in') || lang.startsWith('hi') || name.includes('india');
+    const isGoogleChrome = name.includes('google') || name.includes('chrome');
+    const isGoogleEnOrIn = isGoogleChrome && isEnglishOrIndian;
+    
+    if (isEnhancedOrPremiumLocal || isGoogleEnOrIn) {
+      filteredVoices.push(voice);
     }
   });
 
-  const sortedVoices = [...indianVoices, ...englishVoices];
+  // Sort voices so Samantha (default) is at the top, followed alphabetically by others
+  const sortedVoices = filteredVoices.sort((a, b) => {
+    const aName = a.name.toLowerCase();
+    const bName = b.name.toLowerCase();
+    if (aName.includes('samantha')) return -1;
+    if (bName.includes('samantha')) return 1;
+    return aName.localeCompare(bName);
+  });
   
   sortedVoices.forEach(voice => {
     const option = document.createElement('option');
     option.value = voice.name;
     
-    // Highlight premium or default voices
+    // Add descriptive tags to clearly explain which model is which
+    const name = voice.name.toLowerCase();
+    let tag = '';
+    
+    if (voice.localService) {
+      if (name.includes('enhanced')) {
+        tag = '[macOS Enhanced]';
+      } else if (name.includes('premium')) {
+        tag = '[macOS Premium]';
+      } else {
+        tag = '[macOS Local]';
+      }
+    } else if (name.includes('google') || name.includes('chrome')) {
+      tag = '[Chrome Cloud]';
+    } else {
+      tag = '[Cloud Neural]';
+    }
+    
     const isDefault = voice.default ? ' [Default]' : '';
-    const isLocal = voice.localService ? '' : ' (Cloud)';
-    option.textContent = `${voice.name} (${voice.lang})${isDefault}${isLocal}`;
+    option.textContent = `${voice.name} (${voice.lang}) ${tag}${isDefault}`;
     
     if (voice.name === state.selectedVoiceName || (voice.default && !state.selectedVoiceName)) {
       option.selected = true;
       state.selectedVoiceName = voice.name;
     }
     
-    elements.voiceSelect.appendChild(option);
+    systemGroup.appendChild(option);
   });
 }
 
@@ -148,7 +367,10 @@ if (synth) {
   }
   // Initial load
   loadVoices();
+} else {
+  loadVoices();
 }
+setModelStatus(hasWebGPU ? 'not loaded (pick a Kokoro voice)' : 'unavailable (WebGPU not supported)');
 
 // --- Text Cleanup for Speech ---
 function cleanTextForSpeech(text) {
@@ -182,6 +404,28 @@ function cleanTextForSpeech(text) {
 }
 
 // --- Custom Speech Queue Processor ---
+// Pre-generated Kokoro clip for the next queued comment, so neural voices don't pause to synthesize
+let prefetched = null; // { id, voiceName, promise }
+
+function prefetchNextComment() {
+  const next = state.speechQueue[0];
+  if (!next || !isKokoroVoice() || prefetched?.id === next.id) return;
+  
+  const text = cleanTextForSpeech(next.body);
+  if (!text) return;
+  const voiceName = state.selectedVoiceName;
+  const promise = generateKokoroAudio(text, voiceName);
+  promise.catch(() => {}); // Errors surface when the clip is consumed
+  prefetched = { id: next.id, voiceName, promise };
+}
+
+function takePrefetched(comment) {
+  const hit = prefetched && prefetched.id === comment.id && prefetched.voiceName === state.selectedVoiceName;
+  const promise = hit ? prefetched.promise : undefined;
+  prefetched = null;
+  return promise;
+}
+
 function processSpeechQueue() {
   if (state.isSpeaking || state.speechQueue.length === 0 || !state.isListening) {
     return;
@@ -197,27 +441,18 @@ function processSpeechQueue() {
     return;
   }
   
-  const utterance = new SpeechSynthesisUtterance(cleanedText);
-  
-  // Find selected voice
-  const activeVoice = state.voices.find(v => v.name === state.selectedVoiceName);
-  if (activeVoice) {
-    utterance.voice = activeVoice;
-  }
-  
-  utterance.rate = state.speechRate;
-  utterance.pitch = state.speechPitch;
-  
   // Visual effects linked to active speech
-  utterance.onstart = () => {
+  const handleSpeechStart = () => {
     elements.soundwave.classList.add('speaking');
     
     // Highlight the card currently playing
     const activeCard = document.getElementById(`comment-${comment.id}`);
     if (activeCard) {
-      activeCard.classList.add('super-popular');
+      activeCard.classList.add('now-speaking');
       activeCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
+    
+    prefetchNextComment();
   };
   
   const handleSpeechEnd = () => {
@@ -227,7 +462,7 @@ function processSpeechQueue() {
     
     const activeCard = document.getElementById(`comment-${comment.id}`);
     if (activeCard) {
-      activeCard.classList.remove('super-popular');
+      activeCard.classList.remove('now-speaking');
     }
     
     // Wait for a pleasant gap (2.0 seconds) before speaking the next comment
@@ -237,19 +472,16 @@ function processSpeechQueue() {
     }, 2000);
   };
   
-  utterance.onend = handleSpeechEnd;
-  
-  utterance.onerror = (e) => {
-    console.error('Speech synthesis error:', e);
-    handleSpeechEnd();
-  };
-  
-  synth.speak(utterance);
+  speakText(cleanedText, {
+    onStart: handleSpeechStart,
+    onEnd: handleSpeechEnd,
+    pendingAudio: takePrefetched(comment)
+  });
 }
 
 // --- Play Text-To-Speech (TTS) ---
 function speakComment(comment) {
-  if (!synth || !state.isListening) return;
+  if (!state.isListening) return;
   state.speechQueue.push(comment);
   processSpeechQueue();
 }
@@ -311,119 +543,176 @@ function renderCommentCard(comment) {
   const replayBtn = card.querySelector('.btn-replay');
   replayBtn.addEventListener('click', () => {
     // Replay speaks independently of current subscription status
-    const origUtterance = new SpeechSynthesisUtterance(cleanTextForSpeech(comment.body));
-    const activeVoice = state.voices.find(v => v.name === state.selectedVoiceName);
-    if (activeVoice) origUtterance.voice = activeVoice;
-    origUtterance.rate = state.speechRate;
-    origUtterance.pitch = state.speechPitch;
-    
-    origUtterance.onstart = () => elements.soundwave.classList.add('speaking');
-    origUtterance.onend = () => elements.soundwave.classList.remove('speaking');
-    
-    synth.cancel();
-    synth.speak(origUtterance);
+    stopSpeech();
+    speakText(cleanTextForSpeech(comment.body), {
+      onStart: () => elements.soundwave.classList.add('speaking'),
+      onEnd: () => elements.soundwave.classList.remove('speaking')
+    });
   });
   
   // Insert at top of timeline (reverse chronological order)
   elements.commentsFeed.insertBefore(card, elements.commentsFeed.firstChild);
+  pruneFeed();
+}
+
+function pruneFeed() {
+  const cards = elements.commentsFeed.querySelectorAll('.comment-card');
+  for (let i = MAX_FEED_CARDS; i < cards.length; i++) {
+    // Keep the card that's currently being read aloud
+    if (!cards[i].classList.contains('now-speaking')) cards[i].remove();
+  }
 }
 
 // --- Fetch & Process Comments ---
+// Returns the delay (seconds) until the next poll
 async function fetchMatchComments() {
-  if (!state.isListening) return;
+  if (!state.isListening) return state.refreshInterval;
   
   updateSyncStatus('Fetching...');
   
   try {
     const response = await fetch(`/api/comments?url=${encodeURIComponent(state.redditUrl)}`);
+    const data = await response.json().catch(() => ({}));
     
     if (!response.ok) {
-      const errData = await response.json();
-      throw new Error(errData.error || `Proxy returned ${response.status}`);
+      const error = new Error(data.error || `Proxy returned ${response.status}`);
+      error.retryAfter = data.retryAfter;
+      throw error;
     }
     
-    const data = await response.json();
+    if (!state.isListening) return state.refreshInterval; // Stopped while the request was in flight
+    
     const incomingComments = data.comments || [];
     
     state.commentsFetchedCount = incomingComments.length;
+    state.fetchSource = data.stale ? `${data.source}, cached` : data.source || '';
     
-    // Find the newest comment time as a reference to prevent clock drift issues
-    const newestComment = incomingComments[0];
-    const referenceTime = newestComment ? newestComment.created_utc : Math.floor(Date.now() / 1000);
+    // Use the newest comment time as a reference to prevent clock drift issues.
+    // Mirror HTML includes nested replies, so the first item isn't guaranteed to be the newest.
+    const referenceTime = incomingComments.length
+      ? Math.max(...incomingComments.map(c => c.created_utc))
+      : Math.floor(Date.now() / 1000);
     const cutoffTime = referenceTime - state.lookupWindow;
     
-    // Process comments. Note: Reddit sorting by "new" returns newest comments first.
-    // We reverse them to queue the older ones first in our Text-To-Speech engine.
-    const commentsToSpeak = [];
+    const selected = state.autoTune
+      ? autoSelectComments(incomingComments, referenceTime)
+      : incomingComments.filter(comment =>
+          comment.score >= state.upvoteThreshold &&       // 1. Upvote Filter
+          !state.playedCommentIds.has(comment.id) &&      // 2. Deduplication Filter
+          comment.created_utc >= cutoffTime                // 3. Time Filter
+        );
     
-    incomingComments.slice().reverse().forEach(comment => {
-      // 1. Upvote Filter
-      if (comment.score < state.upvoteThreshold) return;
-      
-      // 2. Deduplication Filter
-      if (state.playedCommentIds.has(comment.id)) return;
-      
-      // 3. Time Filter: only process comments posted within the lookup window
-      if (comment.created_utc < cutoffTime) return;
-      
-      // Record comment as seen
-      state.playedCommentIds.add(comment.id);
-      
-      // Render timeline card
-      renderCommentCard(comment);
-      
-      // Queue for speech
-      commentsToSpeak.push(comment);
-    });
+    // Queue older comments first so they're read in chronological order
+    const commentsToSpeak = selected.sort((a, b) => a.created_utc - b.created_utc);
     
-    // Add comments to our custom speech queue to play with gaps
     commentsToSpeak.forEach(comment => {
+      state.playedCommentIds.add(comment.id);
+      renderCommentCard(comment);
       speakComment(comment);
     });
     
     // Update active visual timestamps
     state.lastSyncTime = new Date();
+    state.consecutiveErrors = 0;
     updateSyncStatus('Active');
     updateStatsDisplay();
-    resetCountdown();
+    
+    // Server is serving cached data because every source is cooling down; wait as long as it asks
+    return Math.max(state.refreshInterval, data.retryAfter || 0);
     
   } catch (error) {
     console.error('Fetcher error:', error);
+    state.consecutiveErrors++;
     updateSyncStatus('Error', error.message);
+    
+    // Exponential backoff so repeated failures don't keep hitting Reddit at full rate
+    const backoff = state.refreshInterval * 2 ** Math.min(state.consecutiveErrors, 4);
+    return Math.min(MAX_ERROR_BACKOFF_SEC, Math.max(backoff, error.retryAfter || 0));
   }
 }
 
+// --- Auto-tune Filters ---
+// Picks the best 1–10 unread comments for this refresh. Starts from the user's lookup window and
+// widens it while the thread is quiet; the threshold becomes the lowest score that made the cut.
+function autoSelectComments(comments, referenceTime) {
+  const unread = comments.filter(c => !state.playedCommentIds.has(c.id));
+  const inWindow = windowSec => unread.filter(c => c.created_utc >= referenceTime - windowSec);
+  
+  let windowSec = state.lookupWindow;
+  let candidates = inWindow(windowSec);
+  while (candidates.length < AUTO_MIN_COMMENTS && windowSec < LOOKUP_WINDOW_MAX) {
+    windowSec = Math.min(LOOKUP_WINDOW_MAX, Math.ceil((windowSec * 1.5) / 30) * 30);
+    candidates = inWindow(windowSec);
+  }
+  
+  // Highest score first; newer wins ties
+  const selected = candidates
+    .sort((a, b) => b.score - a.score || b.created_utc - a.created_utc)
+    .slice(0, AUTO_MAX_COMMENTS);
+  
+  state.autoLookupWindow = windowSec;
+  if (selected.length) state.autoThreshold = selected[selected.length - 1].score;
+  renderFilterControls();
+  return selected;
+}
+
+// Reflects manual vs auto-tuned filter values in the sliders
+function renderFilterControls() {
+  const auto = state.autoTune;
+  const threshold = auto && state.autoThreshold !== null ? state.autoThreshold : state.upvoteThreshold;
+  
+  elements.upvoteThresholdInput.disabled = auto;
+  elements.upvoteThresholdInput.value = Math.min(threshold, Number(elements.upvoteThresholdInput.max));
+  elements.upvoteVal.textContent = auto ? (state.autoThreshold === null ? 'Auto' : `Auto · ${threshold}`) : threshold;
+  
+  const windowSec = auto && state.isListening && state.autoLookupWindow ? state.autoLookupWindow : state.lookupWindow;
+  elements.lookupVal.textContent = windowSec !== state.lookupWindow ? `${state.lookupWindow}s → ${windowSec}s` : `${windowSec}s`;
+}
+
 // --- Polling and Timers ---
+// A poll is only scheduled after the previous one finishes, so slow failovers never overlap
+function schedulePoll(delaySec) {
+  clearTimeout(state.pollingTimeoutId);
+  state.nextPollAt = Date.now() + delaySec * 1000;
+  resetCountdown();
+  state.pollingTimeoutId = setTimeout(runPoll, delaySec * 1000);
+}
+
+async function runPoll() {
+  if (!state.isListening || state.isFetching) return;
+  state.isFetching = true;
+  const nextDelay = await fetchMatchComments();
+  state.isFetching = false;
+  if (state.isListening) schedulePoll(nextDelay);
+}
+
 function startPolling() {
   // Set starting timestamp (in UTC seconds)
   state.appStartTimestamp = Math.floor(Date.now() / 1000);
+  state.consecutiveErrors = 0;
   
   // Clear any existing timers
-  clearInterval(state.pollingIntervalId);
+  clearTimeout(state.pollingTimeoutId);
   clearInterval(state.countdownIntervalId);
   
   // Perform immediate first fetch
-  fetchMatchComments();
-  
-  // Set recursive polling interval
-  state.pollingIntervalId = setInterval(fetchMatchComments, state.refreshInterval * 1000);
+  runPoll();
   
   // Start countdown visual timer
-  resetCountdown();
   state.countdownIntervalId = setInterval(() => {
-    if (state.countdownTimeLeft > 0) {
-      state.countdownTimeLeft--;
-      elements.statCountdown.textContent = `${state.countdownTimeLeft}s`;
-    } else {
+    if (state.isFetching) {
       elements.statCountdown.textContent = 'Syncing...';
+      return;
     }
+    state.countdownTimeLeft = Math.max(0, Math.ceil((state.nextPollAt - Date.now()) / 1000));
+    elements.statCountdown.textContent = `${state.countdownTimeLeft}s`;
   }, 1000);
 }
 
 function stopPolling() {
-  clearInterval(state.pollingIntervalId);
+  clearTimeout(state.pollingTimeoutId);
   clearInterval(state.countdownIntervalId);
-  state.pollingIntervalId = null;
+  state.pollingTimeoutId = null;
   state.countdownIntervalId = null;
   
   // Clear custom speech queue and active gaps
@@ -431,16 +720,16 @@ function stopPolling() {
   state.isSpeaking = false;
   clearTimeout(state.speechGapTimeoutId);
   
-  if (synth) {
-    synth.cancel(); // Stop playing speech
-  }
+  prefetched = null;
+  stopSpeech();
   
   elements.soundwave.classList.remove('speaking');
   updateSyncStatus('Idle');
+  renderFilterControls();
 }
 
 function resetCountdown() {
-  state.countdownTimeLeft = state.refreshInterval;
+  state.countdownTimeLeft = Math.max(0, Math.ceil((state.nextPollAt - Date.now()) / 1000));
   elements.statCountdown.textContent = `${state.countdownTimeLeft}s`;
 }
 
@@ -457,7 +746,7 @@ function updateSyncStatus(status, detail = '') {
     elements.statusLabel.textContent = 'Fetching Comments...';
   } else if (status === 'Active') {
     elements.systemStatusDot.classList.add('status-active');
-    elements.statusLabel.textContent = 'Listening Live';
+    elements.statusLabel.textContent = state.fetchSource ? `Listening Live · ${state.fetchSource}` : 'Listening Live';
     elements.statSyncTime.textContent = state.lastSyncTime ? state.lastSyncTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Just now';
   } else if (status === 'Error') {
     elements.systemStatusDot.classList.add('status-idle');
@@ -472,6 +761,16 @@ function updateStatsDisplay() {
 
 // --- Input synchronizers & Interactive elements ---
 
+// Auto-tune toggle
+elements.autoTuneInput.addEventListener('change', (e) => {
+  state.autoTune = e.target.checked;
+  state.autoThreshold = null;
+  state.autoLookupWindow = null;
+  renderFilterControls();
+});
+state.autoTune = elements.autoTuneInput.checked;
+renderFilterControls();
+
 // Upvote slider sync
 elements.upvoteThresholdInput.addEventListener('input', (e) => {
   state.upvoteThreshold = parseInt(e.target.value, 10);
@@ -482,22 +781,30 @@ elements.upvoteThresholdInput.addEventListener('input', (e) => {
 elements.refreshIntervalInput.addEventListener('input', (e) => {
   state.refreshInterval = parseInt(e.target.value, 10);
   elements.intervalVal.textContent = `${state.refreshInterval}s`;
-  
-  // If active, reset and update current timer
-  if (state.isListening) {
-    startPolling();
-  }
+});
+
+// Reschedule on release only (not every drag tick) and never fire an extra immediate request
+elements.refreshIntervalInput.addEventListener('change', () => {
+  if (!state.isListening || state.isFetching || state.consecutiveErrors > 0) return;
+  const elapsedSec = state.lastSyncTime ? (Date.now() - state.lastSyncTime.getTime()) / 1000 : 0;
+  schedulePoll(Math.max(5, state.refreshInterval - elapsedSec));
 });
 
 // Lookup window slider sync
 elements.lookupWindowInput.addEventListener('input', (e) => {
   state.lookupWindow = parseInt(e.target.value, 10);
-  elements.lookupVal.textContent = `${state.lookupWindow}s`;
+  renderFilterControls();
 });
 
 // Voice selectors & settings sync
 elements.voiceSelect.addEventListener('change', (e) => {
   state.selectedVoiceName = e.target.value;
+  syncPitchControl();
+  
+  // Start downloading/compiling the neural model as soon as it's picked
+  if (isKokoroVoice()) {
+    getKokoro().catch(err => console.error('Kokoro model failed to load:', err));
+  }
 });
 
 elements.voiceRateInput.addEventListener('input', (e) => {
@@ -523,20 +830,13 @@ elements.btnPaste.addEventListener('click', async () => {
 
 // Test Voice settings
 elements.btnTestVoice.addEventListener('click', () => {
-  if (!synth) return;
-  synth.cancel(); // cancel current speech
+  stopSpeech();
+  if (isKokoroVoice()) getAudioContext(); // Unlock audio during the user gesture
   
-  const testUtterance = new SpeechSynthesisUtterance('Testing Reddit Whisper. Audio engine configured correctly.');
-  const activeVoice = state.voices.find(v => v.name === state.selectedVoiceName);
-  if (activeVoice) testUtterance.voice = activeVoice;
-  
-  testUtterance.rate = state.speechRate;
-  testUtterance.pitch = state.speechPitch;
-  
-  testUtterance.onstart = () => elements.soundwave.classList.add('speaking');
-  testUtterance.onend = () => elements.soundwave.classList.remove('speaking');
-  
-  synth.speak(testUtterance);
+  speakText('Testing Reddit Whisper. Audio engine configured correctly.', {
+    onStart: () => elements.soundwave.classList.add('speaking'),
+    onEnd: () => elements.soundwave.classList.remove('speaking')
+  });
 });
 
 // Clear Feed history
@@ -580,13 +880,9 @@ elements.btnToggleListening.addEventListener('click', () => {
     elements.lookupWindowInput.disabled = true;
     
     // Trigger notification
-    if (synth) {
-      synth.cancel();
-      const startUtterance = new SpeechSynthesisUtterance('Whisperer activated. Subscribing to Reddit thread.');
-      const activeVoice = state.voices.find(v => v.name === state.selectedVoiceName);
-      if (activeVoice) startUtterance.voice = activeVoice;
-      synth.speak(startUtterance);
-    }
+    stopSpeech();
+    if (isKokoroVoice()) getAudioContext(); // Unlock audio during the user gesture
+    speakText('Whisperer activated. Subscribing to Reddit thread.');
     
     // Start Scraper Loop
     startPolling();
@@ -620,3 +916,76 @@ function escapeHTML(str) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
 }
+
+// --- Reddit Access (login session) ---
+// The header marks requests from this page; the server rejects auth calls without it
+const AUTH_HEADERS = { 'X-Reddit-Whisper': '1' };
+
+function renderAuthStatus({ mode, user }) {
+  const labels = {
+    session: user ? `Logged in as u/${user}` : 'Logged in (session saved)',
+    anonymous: 'Anonymous (likely blocked)'
+  };
+  elements.authStatus.textContent = labels[mode] || 'Unknown';
+  elements.authStatus.className = `auth-pill ${mode === 'session' ? 'auth-pill-ok' : 'auth-pill-warn'}`;
+  elements.btnClearSession.hidden = mode !== 'session';
+  // Pasting the cookie is the only way to log in, so keep it visible until a session exists
+  if (mode === 'anonymous') elements.sessionPaste.open = true;
+}
+
+async function loadAuthStatus() {
+  try {
+    const res = await fetch('/api/auth/status', { headers: AUTH_HEADERS });
+    renderAuthStatus(await res.json());
+  } catch {
+    elements.authStatus.textContent = 'Status unavailable';
+  }
+}
+
+async function postSession(body) {
+  const res = await fetch('/api/auth/session', {
+    method: 'POST',
+    headers: { ...AUTH_HEADERS, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `Saving failed (${res.status})`);
+  return data;
+}
+
+elements.sessionForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const session = elements.sessionInput.value.trim();
+  if (!session) {
+    elements.sessionInput.focus();
+    return;
+  }
+  
+  elements.btnSaveSession.disabled = true;
+  elements.btnSaveSession.textContent = 'Checking…';
+  try {
+    const data = await postSession({ session });
+    elements.sessionInput.value = '';
+    renderAuthStatus(data);
+    elements.authHint.textContent = data.verified
+      ? 'Login saved to .env and active now.'
+      : "Saved, but Reddit didn't confirm the login. If fetching still fails, the cookie may be expired; copy it again after logging in.";
+    if (data.verified) elements.sessionPaste.open = false;
+  } catch (err) {
+    elements.authHint.textContent = err.message;
+  } finally {
+    elements.btnSaveSession.disabled = false;
+    elements.btnSaveSession.textContent = 'Save';
+  }
+});
+
+elements.btnClearSession.addEventListener('click', async () => {
+  try {
+    renderAuthStatus(await postSession({ clear: true }));
+    elements.authHint.textContent = 'Saved login removed.';
+  } catch (err) {
+    elements.authHint.textContent = err.message;
+  }
+});
+
+loadAuthStatus();

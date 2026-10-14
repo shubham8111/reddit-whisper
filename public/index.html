@@ -60,10 +60,41 @@
             </div>
             <p class="input-hint">Paste any Reddit post URL. Sorting will automatically be forced to 'New'.</p>
           </div>
+
+          <div class="input-group">
+            <label>Reddit Access</label>
+            <div class="auth-row">
+              <span id="auth-status" class="auth-pill auth-pill-warn">Checking…</span>
+            </div>
+            <p class="input-hint" id="auth-hint">Reddit blocks anonymous requests. Paste your login cookie below; it stays on this computer (saved to .env).</p>
+            
+            <details class="session-paste" id="session-paste">
+              <summary>Paste your Reddit login cookie</summary>
+              <ol class="paste-steps">
+                <li>In Chrome, open <strong>reddit.com</strong> (logged in) and press <kbd>⌥</kbd><kbd>⌘</kbd><kbd>I</kbd>.</li>
+                <li>Open the <strong>Application</strong> tab. If you don't see it, click <strong>»</strong> at the end of the tab bar, or press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>P</kbd> and run <em>Show Application</em>.</li>
+                <li>Go to <strong>Cookies → https://www.reddit.com</strong>, click the <code>reddit_session</code> row and copy its <strong>Value</strong>.</li>
+              </ol>
+              <p class="paste-alt"><strong>Alternative:</strong> in the <strong>Network</strong> tab, reload the page, click the first request, and under <em>Request Headers</em> copy the whole <code>cookie</code> value. Pasting the full header works too.</p>
+              <form class="paste-form" id="session-form" autocomplete="off">
+                <input type="password" id="session-input" placeholder="Paste reddit_session value" spellcheck="false" autocomplete="off" aria-label="reddit_session cookie value">
+                <button type="submit" class="secondary-btn auth-btn" id="btn-save-session">Save</button>
+              </form>
+              <button type="button" class="text-btn" id="btn-clear-session" hidden>Sign out (remove saved login)</button>
+            </details>
+          </div>
         </div>
 
         <div class="panel-section">
           <h2><span class="section-num">02</span> Listening Filters</h2>
+
+          <label class="toggle-row" for="auto-tune">
+            <input type="checkbox" id="auto-tune" checked>
+            <span class="toggle-text">
+              <span class="toggle-title">Auto-tune filters</span>
+              <span class="toggle-hint">Adjusts threshold &amp; lookup window so each refresh reads 1&ndash;10 of the best new comments.</span>
+            </span>
+          </label>
           
           <div class="slider-group">
             <div class="slider-header">
@@ -89,7 +120,7 @@
               <span class="value-display" id="lookup-val">300s</span>
             </div>
             <input type="range" id="lookup-window" min="30" max="1800" value="300" step="30">
-            <p class="input-hint">At every refresh, check all comments posted in the last N seconds to see if they've met the upvote threshold.</p>
+            <p class="input-hint">At every refresh, check all comments posted in the last N seconds to see if they've met the upvote threshold. With auto-tune on, this is the starting window and widens automatically when the thread is quiet.</p>
           </div>
         </div>
 
@@ -101,6 +132,7 @@
             <select id="voice-select" class="custom-select">
               <option value="">Loading system voices...</option>
             </select>
+            <small id="tts-model-status" class="model-status">Neural model: not loaded</small>
           </div>
 
           <div class="dual-sliders">
@@ -207,6 +239,6 @@
   </div>
 
   <!-- Main JavaScript File -->
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>
