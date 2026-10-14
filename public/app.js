@@ -84,7 +84,16 @@ const elements = {
   
   statSyncTime: document.getElementById('stat-sync-time'),
   statCountdown: document.getElementById('stat-countdown'),
-  statCommentsCount: document.getElementById('stat-comments-count'),
+  statRead: document.getElementById('stat-read'),
+  statSeen: document.getElementById('stat-seen'),
+  
+  nowBoard: document.getElementById('now-board'),
+  boardLabel: document.getElementById('board-label'),
+  nowMeta: document.getElementById('now-meta'),
+  nowText: document.getElementById('now-text'),
+  queueList: document.getElementById('queue-list'),
+  queueEmpty: document.getElementById('queue-empty'),
+  queueCount: document.getElementById('queue-count'),
   
   soundwave: document.getElementById('soundwave-visualizer'),
   commentsFeed: document.getElementById('comments-feed'),
@@ -117,6 +126,10 @@ const KOKORO_VOICES = [
   { id: 'bm_george', label: 'George (UK, male)' }
 ];
 const hasWebGPU = 'gpu' in navigator;
+
+// Kokoro Michael is the default reader; without WebGPU the Samantha system voice is used instead
+const DEFAULT_VOICE = KOKORO_PREFIX + 'am_michael';
+if (hasWebGPU) state.selectedVoiceName = DEFAULT_VOICE;
 
 const kokoroEngine = {
   tts: null,
@@ -370,7 +383,13 @@ if (synth) {
 } else {
   loadVoices();
 }
-setModelStatus(hasWebGPU ? 'not loaded (pick a Kokoro voice)' : 'unavailable (WebGPU not supported)');
+if (isKokoroVoice()) {
+  // Start loading the default neural voice right away so the first comment isn't delayed
+  syncPitchControl();
+  getKokoro().catch(err => console.error('Kokoro model failed to load:', err));
+} else {
+  setModelStatus(hasWebGPU ? 'not loaded (pick a Kokoro voice)' : 'unavailable (WebGPU not supported)');
+}
 
 // --- Text Cleanup for Speech ---
 function cleanTextForSpeech(text) {
@@ -445,11 +464,13 @@ function processSpeechQueue() {
   const handleSpeechStart = () => {
     elements.soundwave.classList.add('speaking');
     
-    // Highlight the card currently playing
+    showOnBoard(comment);
+    
+    // The card leaves "Up next" and heads the "Read" list while it's on the board
     const activeCard = document.getElementById(`comment-${comment.id}`);
     if (activeCard) {
+      moveCardToFeed(activeCard);
       activeCard.classList.add('now-speaking');
-      activeCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
     
     prefetchNextComment();
@@ -464,6 +485,8 @@ function processSpeechQueue() {
     if (activeCard) {
       activeCard.classList.remove('now-speaking');
     }
+    elements.nowBoard.classList.remove('is-reading');
+    elements.boardLabel.textContent = 'Last read';
     
     // Wait for a pleasant gap (2.0 seconds) before speaking the next comment
     state.speechGapTimeoutId = setTimeout(() => {
@@ -488,9 +511,6 @@ function speakComment(comment) {
 
 // --- Live Timeline UI Rendering ---
 function renderCommentCard(comment) {
-  // Hide empty state if present
-  elements.feedEmpty.classList.add('hidden');
-  
   // Check if card already exists
   if (document.getElementById(`comment-${comment.id}`)) return;
   
@@ -506,36 +526,22 @@ function renderCommentCard(comment) {
   }
   
   // Format readable time
-  const dateObj = new Date(comment.created_utc * 1000);
-  const timeStr = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const timeStr = new Date(comment.created_utc * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const author = escapeHTML(comment.author);
+  const permalink = comment.permalink ? escapeHTML(comment.permalink) : null;
   
   card.innerHTML = `
-    <div class="card-header">
-      <div class="author-area">
-        <div class="author-avatar">${comment.author.substring(0, 2).toUpperCase()}</div>
-        <a href="https://reddit.com/user/${comment.author}" target="_blank" class="author-name">u/${comment.author}</a>
+    <div class="card-score" title="${comment.score} upvotes">${comment.score}</div>
+    <div class="card-main">
+      <div class="card-meta">
+        <a href="https://reddit.com/user/${encodeURIComponent(comment.author)}" target="_blank" rel="noopener" class="author-name">u/${author}</a>
+        <span>${timeStr}</span>
       </div>
-      <div class="badge-row">
-        <span class="time-stamp">${timeStr}</span>
-        <div class="upvote-badge">
-          <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M4 14h6v8h4v-8h6L12 4 4 14z"/>
-          </svg>
-          ${comment.score}
-        </div>
+      <p class="card-body">${escapeHTML(comment.body)}</p>
+      <div class="card-actions">
+        <button class="text-btn btn-replay" type="button" data-id="${escapeHTML(comment.id)}">Replay</button>
+        ${permalink ? `<a href="${permalink}" target="_blank" rel="noopener" class="text-btn">Open on Reddit</a>` : ''}
       </div>
-    </div>
-    <div class="card-body">${escapeHTML(comment.body)}</div>
-    <div class="card-footer">
-      <a href="${comment.permalink}" target="_blank" class="card-action-btn btn-reddit">
-        Reddit
-      </a>
-      <button class="card-action-btn btn-replay" data-id="${comment.id}">
-        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="5 3 19 12 5 21 5 3"></polygon>
-        </svg>
-        Replay Audio
-      </button>
     </div>
   `;
   
@@ -550,9 +556,35 @@ function renderCommentCard(comment) {
     });
   });
   
-  // Insert at top of timeline (reverse chronological order)
+  // New comments wait in "Up next" in reading order
+  elements.queueList.appendChild(card);
+  updateQueueDisplay();
+}
+
+// Moves a card to the top of the "Read" list
+function moveCardToFeed(card) {
+  elements.feedEmpty.classList.add('hidden');
   elements.commentsFeed.insertBefore(card, elements.commentsFeed.firstChild);
+  updateQueueDisplay();
   pruneFeed();
+}
+
+function updateQueueDisplay() {
+  const waiting = elements.queueList.querySelectorAll('.comment-card').length;
+  elements.queueEmpty.classList.toggle('hidden', waiting > 0);
+  elements.queueCount.textContent = waiting ? `${waiting} waiting` : '';
+}
+
+function showOnBoard(comment) {
+  elements.nowBoard.classList.add('is-reading');
+  elements.boardLabel.textContent = 'Now reading';
+  elements.nowMeta.innerHTML = `u/${escapeHTML(comment.author)}<span class="score" title="Upvotes">${comment.score}</span>`;
+  elements.nowText.textContent = comment.body;
+  
+  // Restart the reveal animation for each new comment
+  elements.nowText.classList.remove('reveal');
+  void elements.nowText.offsetWidth;
+  elements.nowText.classList.add('reveal');
 }
 
 function pruneFeed() {
@@ -723,6 +755,15 @@ function stopPolling() {
   prefetched = null;
   stopSpeech();
   
+  // Anything still waiting won't be read now; keep it visible under "Read" as skipped
+  [...elements.queueList.querySelectorAll('.comment-card')].reverse().forEach(card => {
+    card.classList.add('skipped');
+    moveCardToFeed(card);
+  });
+  elements.commentsFeed.querySelectorAll('.now-speaking').forEach(card => card.classList.remove('now-speaking'));
+  elements.nowBoard.classList.remove('is-reading');
+  if (state.commentsSpokenCount) elements.boardLabel.textContent = 'Last read';
+  
   elements.soundwave.classList.remove('speaking');
   updateSyncStatus('Idle');
   renderFilterControls();
@@ -739,24 +780,24 @@ function updateSyncStatus(status, detail = '') {
   
   if (status === 'Idle') {
     elements.systemStatusDot.classList.add('status-idle');
-    elements.statusLabel.textContent = 'System Idle';
-    elements.statSyncTime.textContent = 'Stopped';
+    elements.statusLabel.textContent = 'Not listening';
+    elements.statCountdown.textContent = '–';
   } else if (status === 'Fetching...') {
     elements.systemStatusDot.classList.add('status-active');
-    elements.statusLabel.textContent = 'Fetching Comments...';
+    elements.statusLabel.textContent = 'Checking for new comments…';
   } else if (status === 'Active') {
     elements.systemStatusDot.classList.add('status-active');
-    elements.statusLabel.textContent = state.fetchSource ? `Listening Live · ${state.fetchSource}` : 'Listening Live';
-    elements.statSyncTime.textContent = state.lastSyncTime ? state.lastSyncTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Just now';
+    elements.statusLabel.textContent = state.fetchSource ? `Listening via ${state.fetchSource}` : 'Listening';
+    elements.statSyncTime.textContent = state.lastSyncTime ? state.lastSyncTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '–';
   } else if (status === 'Error') {
     elements.systemStatusDot.classList.add('status-idle');
-    elements.statusLabel.textContent = `Sync Error: ${detail}`;
-    elements.statSyncTime.textContent = 'Error occurred';
+    elements.statusLabel.textContent = `Couldn't fetch comments: ${detail}`;
   }
 }
 
 function updateStatsDisplay() {
-  elements.statCommentsCount.textContent = `${state.commentsSpokenCount} / ${state.commentsFetchedCount}`;
+  elements.statRead.textContent = state.commentsSpokenCount;
+  elements.statSeen.textContent = state.commentsFetchedCount;
 }
 
 // --- Input synchronizers & Interactive elements ---
@@ -841,14 +882,12 @@ elements.btnTestVoice.addEventListener('click', () => {
 
 // Clear Feed history
 elements.btnClearFeed.addEventListener('click', () => {
-  elements.commentsFeed.innerHTML = '';
-  // Re-display empty state
-  elements.feedEmpty.classList.remove('hidden');
-  elements.commentsFeed.appendChild(elements.feedEmpty);
+  // Clears the "Read" list; anything in "Up next" stays queued
+  elements.commentsFeed.querySelectorAll('.comment-card:not(.now-speaking)').forEach(card => card.remove());
+  elements.feedEmpty.classList.toggle('hidden', elements.commentsFeed.querySelector('.comment-card') !== null);
   
-  // Reset spoken states
+  // Reset the counter; already-read comments stay remembered so they aren't read again
   state.commentsSpokenCount = 0;
-  state.playedCommentIds.clear();
   updateStatsDisplay();
 });
 
@@ -870,7 +909,7 @@ elements.btnToggleListening.addEventListener('click', () => {
     
     // Toggle UI States
     elements.btnToggleListening.classList.add('listening');
-    elements.btnText.textContent = 'Stop Listening';
+    elements.btnText.textContent = 'Stop listening';
     document.querySelector('.play-icon').classList.add('hidden');
     document.querySelector('.stop-icon').classList.remove('hidden');
     
@@ -893,7 +932,7 @@ elements.btnToggleListening.addEventListener('click', () => {
     
     // Toggle UI States
     elements.btnToggleListening.classList.remove('listening');
-    elements.btnText.textContent = 'Start Listening';
+    elements.btnText.textContent = 'Start listening';
     document.querySelector('.play-icon').classList.remove('hidden');
     document.querySelector('.stop-icon').classList.add('hidden');
     
